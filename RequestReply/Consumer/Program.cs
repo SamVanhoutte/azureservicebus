@@ -2,75 +2,106 @@
 using Microsoft.ServiceBus.Messaging;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Net;
 using System.Text;
 using System.Threading.Tasks;
+using System.Xml;
 
 namespace Consumer
 {
+
     class Program
     {
         const string requestQueueName = "RequestQueue";
         const string responseQueueName = "ReplyQueue";
-
         static void Main(string[] args)
         {
             // If you need to run this through more secured networks, you can uncomment the following line
             // ServiceBusEnvironment.SystemConnectivity.Mode = ConnectivityMode.Http;
 
-            String.Format("Consumer Application").Dump();
+            String.Format("Locator 'processor' Application").Dump();
+
 
             // Verify queue existence
             CreateQueues();
 
             // Create the MessageReceiver and MessageSender
-            var requestClient = QueueClient.Create(requestQueueName);
-            var responseClient = QueueClient.Create(responseQueueName);
+            var requestClient = QueueClient.Create(requestQueueName, ReceiveMode.PeekLock);
 
-            // Read ip address
-            "Please enter an IP address you want to geo-locate".Dump();
-            string ipAddress = Console.ReadLine();
+            var eventDrivenMessagingOptions = new OnMessageOptions();
+            eventDrivenMessagingOptions.AutoComplete = false;
+            eventDrivenMessagingOptions.ExceptionReceived += OnExceptionReceived;
+            eventDrivenMessagingOptions.MaxConcurrentCalls = 5;
+            requestClient.OnMessage(OnMessageArrived, eventDrivenMessagingOptions);
 
-            // Create correlation token for this specific request.
-            string correlationId = Guid.NewGuid().ToString();
 
-            // Pass the IP address as brokered message body (string serialization)
-            // ReplyToSessionId will be used to listen on the reply queue with the correlated session
-            BrokeredMessage requestMessage = new BrokeredMessage(ipAddress);
-            requestMessage.ReplyToSessionId = correlationId;
+            String.Format("Listening for requests...").Dump();
+            "Press enter to exit".Dump();
+            Console.ReadLine();
 
-            // Send the request message.
-            String.Format("Sending request...").Dump();
-            requestClient.Send(requestMessage);
+        }
 
-            String.Format("Listening on session {0}...", correlationId).Dump();
-
-            // Listen on the correlation session
-            // This will make sure that only this specific receiver/thread will get the response message
-            var session = responseClient.AcceptMessageSession(correlationId);
-
-            String.Format("Receiving message...").Dump();
-
-            // Handle response and close : timeout of 60 seconds
-            var responseMessage = session.Receive(TimeSpan.FromSeconds(60));
-
-            if (responseMessage != null)
+        private static void OnMessageArrived(BrokeredMessage requestMessage)
+        {
+            if (requestMessage != null)
             {
-                var responseText = responseMessage.GetBody<string>();
-                if (string.IsNullOrEmpty(responseText))
+                var responseClient = QueueClient.Create(responseQueueName);
+
+                var ipAddress = requestMessage.GetBody<string>();
+                if (string.IsNullOrEmpty(ipAddress))
                 {
-                    String.Format("IP address {0} not located...", ipAddress).Dump();
-                }
-                else
-                {
-                    String.Format("IP address {0} resolved to {1}", ipAddress, responseText).Dump();
+                    "No IP Address provided".Dump();
+                    requestMessage.DeadLetter();       
+                    return;
                 }
 
-                // Remove message from reply queue
-                responseMessage.Complete();
+                String.Format("Received request for IP address {0}...", ipAddress).Dump();
+
+                // Do lookup on IP Address web service
+                string location = getCityForIp(ipAddress);
+                
+                var sessionId = requestMessage.ReplyToSessionId;
+
+                // Create a response message with the actual location in the body (as string)
+                BrokeredMessage responseMessage = new BrokeredMessage(location);
+                String.Format("Sending response with location {0}", location).Dump();
+
+                // Set the SessionId in the response message to the ReplyToSessionId
+                // of the incoming message, and submit to the response queue.
+                responseMessage.SessionId = sessionId;
+                responseClient.Send(responseMessage);
+
+                // Complete the request as we have processed everything
+                requestMessage.Complete();
+
+                String.Format("Good bye!").Dump();
+                Console.ReadLine();
             }
-            // Close the MessageSession.
-            session.Close();
+        }
+
+        private static string getCityForIp(string ipAddress)
+        {
+            string uri = string.Format("http://freegeoip.net/xml/{0}", ipAddress);
+            var freeGeoIPRequest = HttpWebRequest.Create(uri);
+            var response = freeGeoIPRequest.GetResponse();
+            var xmlDoc = new XmlDocument();
+            xmlDoc.Load(response.GetResponseStream());
+            var cityNode = xmlDoc.SelectSingleNode("/Response/City/text()");
+            if (cityNode != null)
+            {
+                return cityNode.InnerText;
+            }
+            else
+            {
+                return "Nothing found";
+            }
+        }
+
+        static void OnExceptionReceived(object sender, ExceptionReceivedEventArgs e)
+        {
+            e.ToString().Dump();
         }
 
         private static void CreateQueues()
@@ -103,4 +134,5 @@ namespace Consumer
             Console.WriteLine(value);
         }
     }
+
 }
